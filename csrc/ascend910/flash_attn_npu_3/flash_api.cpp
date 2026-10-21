@@ -61,34 +61,36 @@ struct FwdMaskDerivation {
     uint32_t maskType;
 };
 
-// Window normalization + mask-type derivation for the metadata *layout*.
-// The KV bound is cache capacity (no D2H). AICPU later refines maskType /
-// windows against the actual max KV length; a capacity-sized bound is not
-// equivalent when q_seqlen > kv_seqlen (a window can still mask rows).
-static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
-                                       int64_t max_seqlen_k_bound)
+static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
+                                     bool& is_local)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
-        window_left = -1;
+    if (max_k > 0 && left >= max_k) {
+        left = -1;
     }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
-        window_right = -1;
+    if (max_k > 0 && right >= max_k) {
+        right = -1;
     }
     if (causal) {
-        window_right = 0;
+        right = 0;
     }
+    is_causal = left < 0 && right == 0;
+    is_local = (left >= 0 || right >= 0) && !is_causal;
+    if (is_local) {
+        if (left < 0) {
+            left = max_k;
+        }
+        if (right < 0) {
+            right = max_k;
+        }
+    }
+}
+
+static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
+                                       int64_t max_seqlen_k_bound)
+{
     FwdMaskDerivation derived;
-    derived.is_causal = (window_left < 0 && window_right == 0);
-    derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    // infinite local side -> finite KV bound, not INT_MAX
-    if (derived.is_local) {
-        if (window_left < 0) {
-            window_left = max_seqlen_k_bound;
-        }
-        if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
-        }
-    }
+    NormalizeAttentionWindow(causal, max_seqlen_k_bound, window_left, window_right, derived.is_causal,
+                             derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)
@@ -393,8 +395,7 @@ std::vector<at::Tensor> mha_fwd(
         } else {
             kvSeqlenBound = k.size(1);
         }
-        FwdMaskDerivation maskDer =
-            DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
+        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
@@ -459,29 +460,12 @@ std::vector<at::Tensor> mha_fwd(
         tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
         tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
         tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
-        // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-            window_size_left = -1;
-        }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-            window_size_right = -1;
-        }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        is_causal = (window_size_left < 0 && window_size_right == 0);
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        const int64_t declared_k =
+            max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                                            : (k.dim() == 4 ? k.size(1) : static_cast<int64_t>(max_kv_seqlen)));
+        NormalizeAttentionWindow(is_causal, declared_k, window_size_left, window_size_right, is_causal, is_local);
         TORCH_CHECK(!(appendKV && is_local),
                     "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
-        // Match Tri Dao set_params_fprop: infinite local side → seqlen_k.
-        if (is_local) {
-            if (window_size_left < 0) {
-                window_size_left = max_kv_seqlen;
-            }
-            if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
-            }
-        }
         if (is_local) {
             tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
             tiling_cpu_ptr->set_windowSizeRight(window_size_right);
@@ -711,10 +695,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                 "] (0 = auto; upper bound = number of AI cores). ");
     TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && is_varlen_q),
                 "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
-    // Mask *layout* (buffer size / kernel template) is derived on host from
-    // the declared seqlen bounds / cache capacity (no D2H). AICPU re-derives
-    // tiling maskType / windows against the actual max KV length.
-    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k);
+    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_k);
     FAMetadataArgs args{};
     args.seqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(seqlensQDev) : 0ULL;
     args.cacheSeqlensAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
@@ -886,17 +867,8 @@ std::vector<at::Tensor> mha_bwd(
     }
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
-    if (window_size_left >= max_seqlen_k - 1) {
-        window_size_left = -1;
-    }
-    if (window_size_right >= max_seqlen_q - 1) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = window_size_left < 0 && window_size_right == 0;
-    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    bool is_local = false;
+    NormalizeAttentionWindow(is_causal, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);

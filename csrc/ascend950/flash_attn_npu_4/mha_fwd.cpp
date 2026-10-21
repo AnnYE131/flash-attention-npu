@@ -221,23 +221,29 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     FAInferTilingData tilingData{};
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "CPU tiling aggregate must remain trivially copyable");
-    if (scheduler_metadata_.has_value()) {
-        const int64_t kv_seqlen_bound =
-            max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
-                                            : (k.dim() == 4 ? k.size(1) : k.size(0)));
-        if (kv_seqlen_bound > 0 && window_size_left >= kv_seqlen_bound) {
-            window_size_left = -1;
+    const int64_t declared_k =
+        max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                                        : (k.dim() == 4 ? k.size(1) : k.size(0)));
+    if (declared_k > 0 && window_size_left >= declared_k) {
+        window_size_left = -1;
+    }
+    if (declared_k > 0 && window_size_right >= declared_k) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    if (is_local) {
+        if (window_size_left < 0) {
+            window_size_left = declared_k;
         }
-        if (kv_seqlen_bound > 0 && window_size_right >= kv_seqlen_bound) {
-            window_size_right = -1;
+        if (window_size_right < 0) {
+            window_size_right = declared_k;
         }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        const bool pure_causal = window_size_left < 0 && window_size_right == 0;
-        is_causal = pure_causal;
-        is_local = !pure_causal && (window_size_left >= 0 || window_size_right >= 0);
-    } else {
+    }
+    if (!scheduler_metadata_.has_value()) {
         // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
         at::Tensor seqused_q_cpu;
         if (is_varlen_q) {
@@ -269,26 +275,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             max_q_seqlen = std::max(max_q_seqlen, q_len);
             max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
         }
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen)
-            window_size_left = -1;
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen)
-            window_size_right = -1;
-        if (is_causal)
-            window_size_right = 0;
-        is_causal = window_size_left < 0 && window_size_right == 0;
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-        if (is_local && window_size_left < 0)
-            window_size_left = max_kv_seqlen;
-        if (is_local && window_size_right < 0)
-            window_size_right = max_kv_seqlen;
-
         const bool fd_shape_supported =
             !is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         SeqlenScratch scratch;
         optiling::FAInferContext ctx;
         fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
-                               seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu,
-                               paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
+                               seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu, paged_KV,
+                               page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
                                is_local ? window_size_left : 0, is_local ? window_size_right : 0, is_varlen_q, is_bf16,
                                batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
@@ -360,8 +353,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         // Alias only the read-only scheduling buffer. Each forward owns a small
         // runtime buffer, so different streams never overwrite shared metadata.
         tiling_dev = metadata;
-        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))},
-                               q.options().dtype(at::kByte));
+        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
         FARuntimeArgs runtimeArgs{};
         runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
         auto& runtime = runtimeArgs.runtime;
@@ -372,8 +364,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
         runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
         runtime.softcapValue = softcap;
-        runtime.windowSizeLeft = is_local && window_size_left < 0 ? metadataKvBound : window_size_left;
-        runtime.windowSizeRight = is_local && window_size_right < 0 ? metadataKvBound : window_size_right;
+        runtime.windowSizeLeft = window_size_left;
+        runtime.windowSizeRight = window_size_right;
         runtime.allowFlashDecode = flashDecodeEnabled;
         auto aicpu = c10_npu::getNPUStreamFromPool();
         if (aicpu.stream(false) == aclStream) {
@@ -396,8 +388,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
                         "create merge completion event failed");
         }
-        auto write_runtime = [runtimeArgs, aclStream, aicpuStream,
-                             input_ready = events.input_ready, done = events.done]() mutable -> int {
+        auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
+                              done = events.done]() mutable -> int {
             TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
             TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS, "wait for merge input failed");
             WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
@@ -462,13 +454,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     }
     auto qSeqDev = static_cast<uint8_t*>(q_seq_i64.data_ptr());
     auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
-    auto seqUsedQDev = seqused_q_.has_value() ?
-        static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
-    auto seqUsedKvDev = seqused_k_.has_value() ?
-        static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
-    auto blockTableDev = paged_KV
-        ? static_cast<uint8_t*>(page_table.data_ptr())
-        : nullptr;
+    auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
+    auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
+    auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     if (is_causal || is_local) {

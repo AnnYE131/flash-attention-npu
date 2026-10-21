@@ -15,7 +15,7 @@ from tests.common.attention_ref import ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
-    make_golden_attention_mask,
+    make_padded_varlen_mask,
     make_random_tensor,
     make_varlen_seqlens_with_unused,
 )
@@ -1238,7 +1238,7 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     window_size,
     softcap,
 ):
-    """Metadata path must follow actual cache_seqlens, not page capacity."""
+    """Window classification uses capacity; alignment uses actual cache lengths."""
     query = make_random_tensor(
         (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
     )
@@ -1249,20 +1249,6 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     scale = 1.0 / (head_size**0.5)
     capacity = int(page_table.shape[1]) * block_size
     assert capacity > kv_seqlen
-
-    def _mask_kind(bound):
-        wl, wr = window_size
-        if bound > 0 and wl >= bound:
-            wl = -1
-        if bound > 0 and wr >= bound:
-            wr = -1
-        if is_causal:
-            wr = 0
-        is_c = wl < 0 and wr == 0
-        is_l = (wl >= 0 or wr >= 0) and not is_c
-        return (is_c, is_l)
-
-    assert _mask_kind(capacity) != _mask_kind(kv_seqlen)
 
     scheduler_metadata = _metadata(
         batch_size=batch_size,
@@ -1309,19 +1295,22 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
         kv_seqlen,
         block_size,
     )
-    mask, is_causal_g, is_local_g = make_golden_attention_mask(
+    _, _, mask = make_padded_varlen_mask(
+        [q_seqlen],
+        [kv_seqlen],
         q_seqlen,
-        kv_seqlen,
+        capacity,
         is_causal,
         window_size[0],
         window_size[1],
     )
+    mask = mask[0, :, :kv_seqlen]
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query.detach().cpu(),
         key_batched,
         value_batched,
         scale,
-        mask if (is_causal_g or is_local_g) else None,
+        mask,
         data_type,
         softcap=softcap,
     )

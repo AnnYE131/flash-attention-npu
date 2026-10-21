@@ -44,6 +44,30 @@ extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
+static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
+                                     bool& is_local)
+{
+    if (max_k > 0 && left >= max_k) {
+        left = -1;
+    }
+    if (max_k > 0 && right >= max_k) {
+        right = -1;
+    }
+    if (causal) {
+        right = 0;
+    }
+    is_causal = left < 0 && right == 0;
+    is_local = (left >= 0 || right >= 0) && !is_causal;
+    if (is_local) {
+        if (left < 0) {
+            left = max_k;
+        }
+        if (right < 0) {
+            right = max_k;
+        }
+    }
+}
+
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
                                            const std::optional<at::Tensor>& seqlensQ)
 {
@@ -264,39 +288,7 @@ std::vector<at::Tensor> mha_fwd(
     const int32_t* seqlens_k_cpu = nullptr;
     int64_t max_kv_seqlen = 0;
 
-    if (use_explicit_metadata) {
-        if (is_varlen_kv) {
-            max_kv_seqlen = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
-        } else if (paged_KV) {
-            if (max_seqlen_k_.has_value()) {
-                max_kv_seqlen = max_seqlen_k_.value();
-            } else if (window_size_left >= 0 || window_size_right >= 0) {
-                // A finite window must be collapsed against the actual KV length
-                // (the max over cache_seqlens), which the AICPU already computed
-                // into the static tiling's maxKvSeqlen — not the page capacity.
-                // Capacity overstates the length of a partially filled KV cache,
-                // so a window smaller than the capacity but covering the whole
-                // used range would otherwise fail to collapse into a plain
-                // causal/no-mask and produce the wrong mask. This is a read-only
-                // D2H of one scalar; the infinite-window (-1,-1) graph-capture
-                // path needs no collapse and never reaches this branch.
-                auto schedMd = scheduler_metadata_.value();
-                at::Tensor maxKvField =
-                    schedMd
-                        .slice(0, static_cast<int64_t>(offsetof(FAInferStaticTilingData, maxKvSeqlen)),
-                               static_cast<int64_t>(offsetof(FAInferStaticTilingData, maxKvSeqlen)) + sizeof(uint32_t))
-                        .contiguous()
-                        .to(at::Device(at::kCPU));
-                uint32_t mdMaxKv = 0;
-                std::memcpy(&mdMaxKv, maxKvField.data_ptr(), sizeof(uint32_t));
-                max_kv_seqlen = static_cast<int64_t>(mdMaxKv);
-            } else {
-                max_kv_seqlen = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
-            }
-        } else {
-            max_kv_seqlen = k.size(1);
-        }
-    } else {
+    if (!use_explicit_metadata) {
         seqlens_k_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
         seqlens_k_cpu = static_cast<const int32_t*>(seqlens_k_cpu_tensor.data_ptr());
         for (int32_t i = 0; i < batch_size; i++) {
@@ -320,28 +312,11 @@ std::vector<at::Tensor> mha_fwd(
         }
     }
 
-    // Window normalization + mask derivation against the actual max KV length,
-    // uniform across metadata and host paths (matches Tri Dao set_params_fprop:
-    // both sides vs seqlen_k, infinite local side -> seqlen_k).
-    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-        window_size_left = -1;
-    }
-    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = (window_size_left < 0 && window_size_right == 0);
-    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = max_kv_seqlen;
-        }
-        if (window_size_right < 0) {
-            window_size_right = max_kv_seqlen;
-        }
-    }
+    const int64_t declared_k = max_seqlen_k_.value_or(
+        paged_KV
+            ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+            : (k.dim() == 4 ? k.size(1) : (use_explicit_metadata ? k.size(0) : static_cast<int64_t>(max_kv_seqlen))));
+    NormalizeAttentionWindow(is_causal, declared_k, window_size_left, window_size_right, is_causal, is_local);
 
     // Per-call runtime values (block/scale/mask) never live in the reusable
     // metadata; serialize them into a small FAInferRuntimeData and transfer H2D.
@@ -848,17 +823,8 @@ std::vector<at::Tensor> mha_bwd(
     }
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
-    if (window_size_left >= max_seqlen_k - 1) {
-        window_size_left = -1;
-    }
-    if (window_size_right >= max_seqlen_q - 1) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = window_size_left < 0 && window_size_right == 0;
-    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    bool is_local = false;
+    NormalizeAttentionWindow(is_causal, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
