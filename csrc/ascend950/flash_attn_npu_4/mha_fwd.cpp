@@ -221,23 +221,29 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     FAInferTilingData tilingData{};
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "CPU tiling aggregate must remain trivially copyable");
-    if (scheduler_metadata_.has_value()) {
-        const int64_t kv_seqlen_bound =
-            max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
-                                            : (k.dim() == 4 ? k.size(1) : k.size(0)));
-        if (kv_seqlen_bound > 0 && window_size_left >= kv_seqlen_bound) {
-            window_size_left = -1;
+    const int64_t declared_k =
+        max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                                        : (k.dim() == 4 ? k.size(1) : k.size(0)));
+    if (declared_k > 0 && window_size_left >= declared_k) {
+        window_size_left = -1;
+    }
+    if (declared_k > 0 && window_size_right >= declared_k) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    if (is_local) {
+        if (window_size_left < 0) {
+            window_size_left = declared_k;
         }
-        if (kv_seqlen_bound > 0 && window_size_right >= kv_seqlen_bound) {
-            window_size_right = -1;
+        if (window_size_right < 0) {
+            window_size_right = declared_k;
         }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        const bool pure_causal = window_size_left < 0 && window_size_right == 0;
-        is_causal = pure_causal;
-        is_local = !pure_causal && (window_size_left >= 0 || window_size_right >= 0);
-    } else {
+    }
+    if (!scheduler_metadata_.has_value()) {
         // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
         at::Tensor seqused_q_cpu;
         if (is_varlen_q) {
@@ -269,19 +275,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             max_q_seqlen = std::max(max_q_seqlen, q_len);
             max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
         }
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen)
-            window_size_left = -1;
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen)
-            window_size_right = -1;
-        if (is_causal)
-            window_size_right = 0;
-        is_causal = window_size_left < 0 && window_size_right == 0;
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-        if (is_local && window_size_left < 0)
-            window_size_left = max_kv_seqlen;
-        if (is_local && window_size_right < 0)
-            window_size_right = max_kv_seqlen;
-
         const bool fd_shape_supported =
             !is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         SeqlenScratch scratch;
@@ -369,8 +362,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
         runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
         runtime.softcapValue = softcap;
-        runtime.windowSizeLeft = is_local && window_size_left < 0 ? metadataKvBound : window_size_left;
-        runtime.windowSizeRight = is_local && window_size_right < 0 ? metadataKvBound : window_size_right;
+        runtime.windowSizeLeft = window_size_left;
+        runtime.windowSizeRight = window_size_right;
         runtime.allowFlashDecode = flashDecodeEnabled;
         auto aicpu = c10_npu::getNPUStreamFromPool();
         if (aicpu.stream(false) == aclStream) {

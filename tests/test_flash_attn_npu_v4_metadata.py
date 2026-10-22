@@ -13,7 +13,7 @@ from tests.common.attention_ref import ref_flash_attention_pair  # noqa: E402
 from tests.common.compare import assert_fa_close  # noqa: E402
 from tests.common.test_utils import (  # noqa: E402
     gather_paged_kv_batch,
-    make_golden_attention_mask,
+    make_padded_varlen_mask,
     make_random_tensor,
     make_varlen_seqlens_with_unused,
 )
@@ -1216,7 +1216,7 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     window_size,
     softcap,
 ):
-    """Metadata path must follow actual cache_seqlens, not page capacity."""
+    """Window classification uses capacity; alignment uses actual cache lengths."""
     if "Ascend950" in _device_name and softcap != 0.0:
         pytest.skip("Ascend950 FA4 kernel does not support softcap")
     query = make_random_tensor(
@@ -1287,19 +1287,22 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
         kv_seqlen,
         block_size,
     )
-    mask, is_causal_g, is_local_g = make_golden_attention_mask(
+    _, _, mask = make_padded_varlen_mask(
+        [q_seqlen],
+        [kv_seqlen],
         q_seqlen,
-        kv_seqlen,
+        capacity,
         is_causal,
         window_size[0],
         window_size[1],
     )
+    mask = mask[0, :, :kv_seqlen]
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query.detach().cpu(),
         key_batched,
         value_batched,
         scale,
-        mask if (is_causal_g or is_local_g) else None,
+        mask,
         data_type,
         softcap=softcap,
     )

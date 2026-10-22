@@ -258,8 +258,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         } else {
             kvSeqlenBound = k.size(1);
         }
-        FwdMaskDerivation maskDer =
-            DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
+        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != 0u;
@@ -293,23 +292,26 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                 max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_ptr[i]);
             }
         }
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+        const int64_t declared_k =
+            max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                                            : (k.dim() == 4 ? k.size(1) : k.size(0)));
+        if (declared_k > 0 && window_size_left >= declared_k) {
             window_size_left = -1;
         }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+        if (declared_k > 0 && window_size_right >= declared_k) {
             window_size_right = -1;
         }
         if (is_causal) {
             window_size_right = 0;
         }
-        is_causal = (window_size_left < 0 && window_size_right == 0);
+        is_causal = window_size_left < 0 && window_size_right == 0;
         is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
         if (is_local) {
             if (window_size_left < 0) {
-                window_size_left = max_kv_seqlen;
+                window_size_left = declared_k;
             }
             if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
+                window_size_right = declared_k;
             }
         }
 

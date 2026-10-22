@@ -464,10 +464,13 @@ def test_fa_kvcache_ops(
     new_kv_seqlen_list_cpu = None
     window_size_left_golden = window_size_left
     window_size_right_golden = window_size_right
-    # Match Tri Dao GPU host: both sides vs kv_seqlen.
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
+    declared_kv = (
+        ((kv_seqlen + block_size - 1) // block_size) * block_size if cache_mode == 1 else kv_seqlen
+    )
+    # Match the host rule: both sides vs the declared KV bound.
+    if declared_kv > 0 and window_size_left_golden >= declared_kv:
         window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
+    if declared_kv > 0 and window_size_right_golden >= declared_kv:
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
@@ -477,9 +480,9 @@ def test_fa_kvcache_ops(
     ) and not is_causal_golden
     if is_local_golden:
         if window_size_left_golden < 0:
-            window_size_left_golden = kv_seqlen
+            window_size_left_golden = declared_kv
         if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
+            window_size_right_golden = declared_kv
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -1024,6 +1027,7 @@ varlen_cases = [
     (torch.bfloat16, 8, 48, 4, 513, 511, 111, False, 511, 0, 0.0, False),
     (torch.float16, 3, 5, 1, 15, 8192, 151, False, -1, -1, 0.0, False),
     (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 4, 2, 513, 129, 160, False, 127, 864, 2.0, True),
     # Effective-length variants: tile boundaries, GQA, and long KV.
     (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0, True),
     (torch.float16, 3, 10, 2, 127, 129, 35, False, -1, -1, 0.0, True),
@@ -1158,9 +1162,7 @@ def test_fa_varlen_ops(
             [output_npu[int(cu_q[i]) : int(cu_q[i]) + used_q_lengths[i]] for i in range(batch_size)]
         )
     assert_fa_close(output_compare, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    if "Ascend910" in name or (
-        "Ascend950" in name and window_size_left == -1 and window_size_right == -1
-    ):
+    if "Ascend910" in name or "Ascend950" in name:
         lse_compare = softmax_lse.transpose(-1, -2) if "Ascend950" in name else softmax_lse
         if add_unused_qkv:
             lse_compare = torch.cat(
@@ -1173,6 +1175,9 @@ def test_fa_varlen_ops(
         assert_fa_close(
             lse_compare, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse"
         )
+    if "Ascend910" in name or (
+        "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+    ):
         dout = make_random_tensor(
             output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu"
         )
