@@ -1121,3 +1121,12 @@ def flash_attn_with_kvcache(
         return_softmax_lse=return_softmax_lse,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """Merge split-KV partial attention outputs (Ascend 950 backend).
+
+    See ``flash_attn_npu_3.flash_attn_combine`` for the full contract; this
+    backend shares the same NV-aligned signature.
+    """
+    return flash_attn_npu_3_950.fwd_combine(out_partial, lse_partial, out, out_dtype)
